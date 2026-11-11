@@ -211,6 +211,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_ESP32_P4_FUNCTION_EV_BOARD
         bool "Espressif ESP32-P4/P4X-Function-EV-Board"
         depends on IDF_TARGET_ESP32P4
+    config BOARD_TYPE_CUSTOM_HCP_P4
+        bool "Custom HCP ESP32-P4 Smart Panel"
+        depends on IDF_TARGET_ESP32P4
     config BOARD_TYPE_ESP32_S3_BOX
         bool "Espressif ESP32-S3-BOX"
         depends on IDF_TARGET_ESP32S3

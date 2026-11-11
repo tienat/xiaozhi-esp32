@@ -256,7 +256,7 @@ RgbLcdDisplay::RgbLcdDisplay(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_h
     };
 
     const lvgl_port_display_rgb_cfg_t rgb_cfg = {.flags = {
-                                                     .bb_mode = true,
+                                                     .bb_mode = false,
                                                      .avoid_tearing = true,
                                                  }};
 
