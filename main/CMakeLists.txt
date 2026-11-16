@@ -1224,6 +1224,14 @@ idf_component_register(SRCS ${SOURCES}
                         bt
                         fatfs
                         xiaozhi-fonts
+                        app_spiffs
+                        app_config
+                        app_network
+                        app_gateway
+                        app_mcp
+                        app_ui
+                        espressif__esp_lcd_touch
+                        espressif__esp_lcd_touch_st7123
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 

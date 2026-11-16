@@ -6,6 +6,9 @@
 #include "display/lcd_display.h"
 #include "lvgl_theme.h"
 #include "wifi_board.h"
+#include "app_mcp.h"
+#include "app_network.h"
+#include "app_ui.h"
 
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
@@ -216,6 +219,183 @@ private:
                                      DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
+    /* ==================== ST7102 TDDI Touch Driver ==================== */
+    static inline SemaphoreHandle_t s_touch_sem = nullptr;
+    static inline portMUX_TYPE s_touch_mux = portMUX_INITIALIZER_UNLOCKED;
+    static inline struct {
+        bool pressed;
+        int16_t x;
+        int16_t y;
+    } s_touch_state = { false, 0, 0 };
+    static inline volatile int64_t s_vsync_time_us = 0;
+    static inline i2c_master_dev_handle_t s_touch_i2c_dev = nullptr;
+
+    static IRAM_ATTR void VsyncGpioIsr(void *arg) {
+        (void)arg;
+        s_vsync_time_us = esp_timer_get_time();
+    }
+
+    static IRAM_ATTR void TouchGpioIsr(void *arg) {
+        (void)arg;
+        BaseType_t hp = pdFALSE;
+        if (s_touch_sem) {
+            xSemaphoreGiveFromISR(s_touch_sem, &hp);
+        }
+        if (hp) portYIELD_FROM_ISR();
+    }
+
+    static void WaitVfpGap(int need_us) {
+        if (s_vsync_time_us == 0) return;
+        const int64_t period_us = 12460;
+        const int64_t vfp_start = period_us * 750 / 1000;
+        const int64_t vfp_end   = period_us * 830 / 1000 - need_us;
+
+        for (int k = 0; k < 3; k++) {
+            int64_t now = esp_timer_get_time();
+            int64_t dt = now - s_vsync_time_us;
+            if (dt < 0 || dt > 100000) return;
+            if (dt >= vfp_start && dt <= vfp_end) return;
+
+            int64_t wait_us = (dt < vfp_start) ? (vfp_start - dt) : (period_us - dt + vfp_start);
+            if (wait_us <= 0 || wait_us > period_us) return;
+
+            if (wait_us > 1500) {
+                vTaskDelay(pdMS_TO_TICKS(wait_us / 1000));
+            } else {
+                esp_rom_delay_us(wait_us);
+            }
+        }
+    }
+
+    static void TouchTask(void *arg) {
+        auto dev = static_cast<i2c_master_dev_handle_t>(arg);
+        int no_point = 0;
+        TickType_t t_int_low = 0;
+
+        while (true) {
+            bool was_pressed = false;
+            portENTER_CRITICAL(&s_touch_mux);
+            was_pressed = s_touch_state.pressed;
+            portEXIT_CRITICAL(&s_touch_mux);
+
+            // Khi dang cham: hoi deu moi 20ms de theo doi keo/nha.
+            // Khi khong cham: cho ngat canh xuong tren TP_INT (timeout 100ms de phong ket).
+            bool edge = xSemaphoreTake(s_touch_sem, pdMS_TO_TICKS(was_pressed ? 20 : 100)) == pdTRUE;
+            if (!edge && !was_pressed) {
+                if (gpio_get_level(TOUCH_INT_PIN) != 0) {
+                    t_int_low = 0;
+                    continue;
+                }
+                TickType_t now = xTaskGetTickCount();
+                if (t_int_low == 0) { t_int_low = now; continue; }
+                if (now - t_int_low < pdMS_TO_TICKS(100)) continue;
+                t_int_low = now;
+            }
+
+            // Canh dung cua so VFP 750-830 o/oo chu ky khung (Luat 3 / K2)
+            WaitVfpGap(400);
+
+            // 1 giao dich duy nhat 11 byte tu 0x0010 (adv_info 4 byte + point0 7 byte)
+            const uint8_t reg[2] = { 0x00, 0x10 };
+            uint8_t buf[11] = { 0 };
+            esp_err_t err = dev ? i2c_master_transmit_receive(dev, reg, 2, buf, 11, 30) : ESP_ERR_INVALID_STATE;
+            if (err != ESP_OK) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+
+            bool with_coord = (buf[0] & 0x08) != 0;
+            bool valid = (buf[4] & 0x80) != 0;
+
+            if (with_coord && valid) {
+                int rx = ((buf[4] & 0x3F) << 8) | buf[5];
+                int ry = ((buf[6] & 0x3F) << 8) | buf[7];
+                if (rx < DISPLAY_WIDTH && ry < DISPLAY_HEIGHT) {
+                    no_point = 0;
+                    portENTER_CRITICAL(&s_touch_mux);
+                    s_touch_state.x = (int16_t)rx;
+                    s_touch_state.y = (int16_t)ry;
+                    s_touch_state.pressed = true;
+                    portEXIT_CRITICAL(&s_touch_mux);
+                    continue;
+                }
+            }
+
+            // Can 2 lan doc khong co diem lien tiep (>= 25-50ms) de xac nhan nha tay (chong nha gia gay giat UI)
+            if (was_pressed) {
+                if (++no_point >= 2) {
+                    portENTER_CRITICAL(&s_touch_mux);
+                    s_touch_state.pressed = false;
+                    portEXIT_CRITICAL(&s_touch_mux);
+                    no_point = 0;
+                }
+            }
+        }
+    }
+
+    static void CustomTouchReadCb(lv_indev_t *indev, lv_indev_data_t *data) {
+        (void)indev;
+        portENTER_CRITICAL(&s_touch_mux);
+        if (s_touch_state.pressed) {
+            data->point.x = s_touch_state.x;
+            data->point.y = s_touch_state.y;
+            data->state = LV_INDEV_STATE_PRESSED;
+        } else {
+            data->state = LV_INDEV_STATE_RELEASED;
+        }
+        portEXIT_CRITICAL(&s_touch_mux);
+    }
+
+    void InitializeTouch() {
+        ESP_LOGI(TAG, "Khoi tao ST7102 TDDI Touch driver doc lap (VFP Gated)");
+
+        s_touch_sem = xSemaphoreCreateBinary();
+        s_touch_mux = portMUX_INITIALIZER_UNLOCKED;
+        s_touch_state = { false, 0, 0 };
+        s_vsync_time_us = 0;
+
+        i2c_device_config_t dev_cfg = {};
+        dev_cfg.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        dev_cfg.device_address = TOUCH_I2C_ADDR;
+        dev_cfg.scl_speed_hz = 400000;
+        dev_cfg.scl_wait_us = 30000;
+
+        esp_err_t err = i2c_master_bus_add_device(i2c_bus_, &dev_cfg, &s_touch_i2c_dev);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Loi them I2C device touch: %s", esp_err_to_name(err));
+            return;
+        }
+
+        gpio_config_t io_cfg = {};
+        io_cfg.pin_bit_mask = (1ULL << TOUCH_INT_PIN);
+        io_cfg.mode = GPIO_MODE_INPUT;
+        io_cfg.pull_up_en = GPIO_PULLUP_ENABLE;
+        io_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_cfg.intr_type = GPIO_INTR_NEGEDGE;
+        gpio_config(&io_cfg);
+
+        gpio_install_isr_service(0);
+        gpio_isr_handler_add(TOUCH_INT_PIN, TouchGpioIsr, NULL);
+
+        // Lang nghe VSYNC tren LCD_RGB_VSYNC_PIN (GPIO 33)
+        // LUU Y: TUYET DOI KHONG goi gpio_set_direction vi se ngat peripheral LCDCAM khoi GPIO33!
+        // Chi bat input buffer tren GPIO33 de doc canh xuong VSYNC tu LCDCAM phuc vu cua so VFP touch:
+        gpio_input_enable(LCD_RGB_VSYNC_PIN);
+        gpio_set_intr_type(LCD_RGB_VSYNC_PIN, GPIO_INTR_NEGEDGE);
+        gpio_isr_handler_add(LCD_RGB_VSYNC_PIN, VsyncGpioIsr, NULL);
+
+        xTaskCreatePinnedToCore(TouchTask, "hcp_touch", 4096, s_touch_i2c_dev, 5, NULL, 1);
+
+        if (lvgl_port_lock(0)) {
+            lv_indev_t *indev = lv_indev_create();
+            lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+            lv_indev_set_read_cb(indev, CustomTouchReadCb);
+            lv_indev_set_display(indev, lv_display_get_default());
+            lvgl_port_unlock();
+            ESP_LOGI(TAG, "Dang ky non-blocking ST7102 touch indev thanh cong vao LVGL!");
+        }
+    }
+
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
@@ -227,11 +407,21 @@ private:
         });
     }
 
+    void InitializeTools() {
+        AppMcpBridge::GetInstance().Initialize();
+    }
+
 public:
     HcpP4Board() : boot_button_(BOOT_BUTTON_GPIO) {
         InitializeI2c();
         InitializeLcd();
+        if (lvgl_port_lock(0)) {
+            app_ui_show_splash();
+            lvgl_port_unlock();
+        }
+        InitializeTouch();
         InitializeButtons();
+        InitializeTools();
         GetBacklight()->RestoreBrightness();
     }
 
@@ -266,6 +456,41 @@ public:
          * Tuyet doi khong dung GPIO12 hay PWM. */
         static HcpGpioBacklight backlight(DISPLAY_BACKLIGHT_PIN);
         return &backlight;
+    }
+
+    virtual void StartNetwork() override {
+        /* Dong bo trang thai ket noi tu app_network (wifi_c6 qua SDIO C6) voi Xiaozhi Application */
+        app_network_register_event_cb([](app_network_event_t event, void *ctx) {
+            auto self = static_cast<HcpP4Board*>(ctx);
+            switch (event) {
+            case APP_NETWORK_EVENT_CONNECTED: {
+                char ssid[33] = {0};
+                app_network_get_ssid(ssid, sizeof(ssid));
+                self->OnNetworkEvent(NetworkEvent::Connected, ssid);
+                break;
+            }
+            case APP_NETWORK_EVENT_CONNECTING: {
+                char ssid[33] = {0};
+                app_network_get_ssid(ssid, sizeof(ssid));
+                self->OnNetworkEvent(NetworkEvent::Connecting, ssid);
+                break;
+            }
+            case APP_NETWORK_EVENT_DISCONNECTED:
+            case APP_NETWORK_EVENT_FAILED:
+                self->OnNetworkEvent(NetworkEvent::Disconnected);
+                break;
+            default:
+                break;
+            }
+        }, this);
+
+        if (app_network_is_connected()) {
+            char ssid[33] = {0};
+            app_network_get_ssid(ssid, sizeof(ssid));
+            OnNetworkEvent(NetworkEvent::Connected, ssid);
+        } else {
+            OnNetworkEvent(NetworkEvent::Connecting, "");
+        }
     }
 };
 

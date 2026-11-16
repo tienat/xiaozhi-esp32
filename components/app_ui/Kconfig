@@ -1,0 +1,7 @@
+config HCP_ONBOARDING_WIDGETS
+    bool
+    default y if BOARD_TYPE_CUSTOM_HCP_P4
+    select LV_USE_KEYBOARD
+    select LV_USE_SPINNER
+    help
+        Widgets required for the touch-based HCP onboarding flow.

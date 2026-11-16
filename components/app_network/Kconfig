@@ -1,0 +1,8 @@
+menu "HCP network diagnostics"
+    config HCP_WIFI_LOCAL_OVERRIDE
+        bool "Connect using Wi-Fi credentials from local diagnostic header"
+        default n
+        help
+            Explicit diagnostic override. Leave disabled for touch onboarding and
+            to preserve the customer's saved Wi-Fi network.
+endmenu
