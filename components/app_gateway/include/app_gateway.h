@@ -161,6 +161,13 @@ esp_err_t app_gateway_send_command(const char *device_id, const char *endpoint_i
 esp_err_t app_gateway_run_scene(const char *scene_id);
 
 /**
+ * @brief Kiem tra va tieu thu khoa In-Flight Guard (chong State Flickering).
+ *        Tra ve true neu trait dang bi khoa boi lenh in-flight va incoming khac target (yeu cau bo qua ghi de).
+ *        Tra ve false neu khong co khoa hoac incoming khop voi target (da hoan thanh lenh).
+ */
+bool app_gateway_check_and_consume_in_flight(const char *device_id, const char *endpoint_id, const char *trait, bool incoming_val);
+
+/**
  * @brief Dang ky callback khi Snapshot hoac trang thai thiet bi thay doi
  */
 typedef void (*app_gateway_update_cb_t)(void);

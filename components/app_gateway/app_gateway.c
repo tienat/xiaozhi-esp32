@@ -690,6 +690,85 @@ esp_err_t app_gateway_unlink(void)
     return ESP_OK;
 }
 
+/* ========================================================================= */
+/* In-Flight Command Guard (Spec 011: chong State Flickering tren cong tac da nut) */
+/* ========================================================================= */
+#define MAX_IN_FLIGHT_CMDS 16
+#define IN_FLIGHT_TIMEOUT_US (2500000LL) /* 2.5 giay bao ve chong state flickering */
+
+typedef struct {
+    char device_id[64];
+    char endpoint_id[16];
+    char trait_name[32];
+    bool target_b;
+    int64_t deadline_us;
+    bool active;
+} in_flight_cmd_t;
+
+static in_flight_cmd_t s_in_flight[MAX_IN_FLIGHT_CMDS];
+
+static void add_in_flight_guard_locked(const char *dev_id, const char *ep_id, const char *trait, bool target_b)
+{
+    int64_t now_us = esp_timer_get_time();
+    int slot_idx = -1;
+
+    for (int i = 0; i < MAX_IN_FLIGHT_CMDS; i++) {
+        if (s_in_flight[i].active &&
+            strcmp(s_in_flight[i].device_id, dev_id) == 0 &&
+            strcmp(s_in_flight[i].endpoint_id, ep_id) == 0 &&
+            strcmp(s_in_flight[i].trait_name, trait) == 0) {
+            slot_idx = i;
+            break;
+        }
+        if (!s_in_flight[i].active || s_in_flight[i].deadline_us < now_us) {
+            if (slot_idx == -1) slot_idx = i;
+        }
+    }
+
+    if (slot_idx >= 0) {
+        strncpy(s_in_flight[slot_idx].device_id, dev_id, sizeof(s_in_flight[slot_idx].device_id) - 1);
+        s_in_flight[slot_idx].device_id[sizeof(s_in_flight[slot_idx].device_id) - 1] = '\0';
+        strncpy(s_in_flight[slot_idx].endpoint_id, ep_id, sizeof(s_in_flight[slot_idx].endpoint_id) - 1);
+        s_in_flight[slot_idx].endpoint_id[sizeof(s_in_flight[slot_idx].endpoint_id) - 1] = '\0';
+        strncpy(s_in_flight[slot_idx].trait_name, trait, sizeof(s_in_flight[slot_idx].trait_name) - 1);
+        s_in_flight[slot_idx].trait_name[sizeof(s_in_flight[slot_idx].trait_name) - 1] = '\0';
+        s_in_flight[slot_idx].target_b = target_b;
+        s_in_flight[slot_idx].deadline_us = now_us + IN_FLIGHT_TIMEOUT_US;
+        s_in_flight[slot_idx].active = true;
+    }
+}
+
+bool app_gateway_check_and_consume_in_flight(const char *device_id, const char *endpoint_id, const char *trait, bool incoming_val)
+{
+    if (!device_id || !endpoint_id || !trait) return false;
+
+    int64_t now_us = esp_timer_get_time();
+
+    /* Ham nay duoc goi khi dang giu s_mutex tu on_mqtt_msg */
+    for (int i = 0; i < MAX_IN_FLIGHT_CMDS; i++) {
+        if (s_in_flight[i].active) {
+            if (s_in_flight[i].deadline_us < now_us) {
+                s_in_flight[i].active = false;
+                continue;
+            }
+            if (strcmp(s_in_flight[i].device_id, device_id) == 0 &&
+                strcmp(s_in_flight[i].endpoint_id, endpoint_id) == 0 &&
+                strcmp(s_in_flight[i].trait_name, trait) == 0) {
+                if (incoming_val == s_in_flight[i].target_b) {
+                    /* Khop target: phan cung da cap nhat thanh cong */
+                    s_in_flight[i].active = false;
+                    return false;
+                } else {
+                    /* Khac target va con han: phan hoi do dang, yeu cau bo qua ghi de */
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 esp_err_t app_gateway_send_command(const char *device_id, const char *endpoint_id, const char *trait, const char *value_json)
 {
     if (!device_id || !endpoint_id || !trait || !value_json) {
@@ -698,6 +777,32 @@ esp_err_t app_gateway_send_command(const char *device_id, const char *endpoint_i
 
     if (!rate_limit_check_cmd()) {
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Cap nhat lac quan (optimistic update) snapshot local kem In-Flight Guard */
+    if (strcmp(trait, "on_off") == 0 && s_snapshot) {
+        bool target_b = (strcmp(value_json, "true") == 0 || strstr(value_json, "true") != NULL);
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        add_in_flight_guard_locked(device_id, endpoint_id, trait, target_b);
+        for (int i = 0; i < s_snapshot->device_count; i++) {
+            if (strcmp(s_snapshot->devices[i].id, device_id) == 0) {
+                for (int ep = 0; ep < s_snapshot->devices[i].endpoint_count; ep++) {
+                    if (strcmp(s_snapshot->devices[i].endpoints[ep].id, endpoint_id) == 0) {
+                        for (int tr = 0; tr < s_snapshot->devices[i].endpoints[ep].trait_count; tr++) {
+                            if (s_snapshot->devices[i].endpoints[ep].traits[tr].type == TRAIT_TYPE_ON_OFF) {
+                                s_snapshot->devices[i].endpoints[ep].traits[tr].state.b_val = target_b;
+                                s_snapshot->devices[i].endpoints[ep].traits[tr].state_valid = true;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+        xSemaphoreGive(s_mutex);
+        notify_update();
     }
 
     return app_gateway_mqtt_publish_device_command(device_id, endpoint_id, trait, value_json, 10000);

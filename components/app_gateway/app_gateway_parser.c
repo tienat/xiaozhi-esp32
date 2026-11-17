@@ -10,6 +10,15 @@
 
 static const char *TAG = "app_gw_parser";
 
+__attribute__((weak)) bool app_gateway_check_and_consume_in_flight(const char *device_id, const char *endpoint_id, const char *trait, bool incoming_val)
+{
+    (void)device_id;
+    (void)endpoint_id;
+    (void)trait;
+    (void)incoming_val;
+    return false;
+}
+
 #define DEDUP_CACHE_SIZE 32
 static char s_recent_msg_ids[DEDUP_CACHE_SIZE][64];
 static size_t s_dedup_idx = 0;
@@ -674,6 +683,15 @@ esp_err_t app_gateway_parser_parse_envelope(const char *json_str,
                                     app_trait_t *tr = &target_dev->endpoints[j].traits[k];
                                     cJSON *val = cJSON_GetObjectItem(state, tr->name);
                                     if (val) {
+                                        /* Spec 011: In-Flight Command Guard chong State Flickering */
+                                        if (tr->type == TRAIT_TYPE_ON_OFF && cJSON_IsBool(val)) {
+                                            bool incoming_b = cJSON_IsTrue(val);
+                                            if (app_gateway_check_and_consume_in_flight(target_dev->id, target_dev->endpoints[j].id, tr->name, incoming_b)) {
+                                                ESP_LOGD(TAG, "In-Flight Guard: bo qua state cu [%s/%s]: %d",
+                                                         target_dev->id, target_dev->endpoints[j].id, incoming_b);
+                                                continue;
+                                            }
+                                        }
                                         parse_trait_state(tr, val);
                                     }
                                 }

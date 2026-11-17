@@ -347,10 +347,20 @@ esp_err_t app_gateway_mqtt_publish_device_command(const char *device_id,
         ttl_ms = 10000;
     }
 
+    /* Quy chuan AsyncAPI NobleX: trait on_off nhan boolean thuan (true/false) chu khong phai object {"on":bool} */
+    const char *final_val = value_json;
+    if (strcmp(trait, "on_off") == 0) {
+        if (strstr(value_json, "true") != NULL) {
+            final_val = "true";
+        } else if (strstr(value_json, "false") != NULL) {
+            final_val = "false";
+        }
+    }
+
     char data_json[512] = {0};
     snprintf(data_json, sizeof(data_json),
              "{\"command_id\":\"%s\",\"ttl_ms\":%lu,\"device_id\":\"%s\",\"endpoint_id\":\"%s\",\"trait\":\"%s\",\"value\":%s}",
-             cmd_id, (unsigned long)ttl_ms, device_id, endpoint_id, trait, value_json);
+             cmd_id, (unsigned long)ttl_ms, device_id, endpoint_id, trait, final_val);
 
     return publish_envelope("device.command", data_json);
 }

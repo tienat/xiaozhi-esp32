@@ -50,7 +50,8 @@ void app_ui_switch_screen(app_ui_screen_t screen)
     } else {
         lv_obj_add_flag(s_scr_pairing, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(s_scr_dashboard, LV_OBJ_FLAG_HIDDEN);
-        if (s_ai_widget) lv_obj_remove_flag(s_ai_widget, LV_OBJ_FLAG_HIDDEN);
+        /* Voice AI tu dong kich hoat bang giong noi, khong can nut micro che man hinh */
+        if (s_ai_widget) lv_obj_add_flag(s_ai_widget, LV_OBJ_FLAG_HIDDEN);
         s_current_screen = APP_UI_SCREEN_DASHBOARD;
     }
 }
